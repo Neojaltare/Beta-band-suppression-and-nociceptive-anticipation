@@ -378,8 +378,6 @@ def Load_EEG_EMG_Paths():
         Behavioural_filenames.append(os.path.join(EMG_path, EMG_to_extract, Behavioural_file[0]))
     return EEG_filenames, EMG_filenames, Behavioural_filenames
 
-
-
 ######################### Custom functions to compute coherence #########################
 def Compute_coherence_multitaper(x, y, fmin = 0, fmax = 60, fs = 1000, bw = 4):
     # Compute multitaper PSD for both signals (x and y)
@@ -421,6 +419,456 @@ def Compute_coherence_nitime(x, y, fs, bw):
 
 
 
+# Functions to extract lateralisation indices from EEG data
+def Extract_Lat_index(this_subject, channel = "Mean"):
+    """
+    Function to extract the lateralization index for a single participant
+    Parameters:
+    - this_subject: MNE TFR object with EEG data and events.
+    - channel: str, the channel to extract the lateralization index for. Can be "FC", "C", "CP" or "Mean".
+    Returns:
+    - Mean_lat_index: float, average lateralization index across left and right arms.
+    """
+    # Construct the left and right chennels by averaging the TFR of the left and right channels respectively
+    if channel == "Mean":
+        left_data = np.zeros((this_subject.data.shape[0], len(Left_channels), this_subject.data.shape[2], this_subject.data.shape[3]))
+        print(left_data.shape) 
+        for idx, channel in enumerate(Left_channels):
+            left_data[:, idx, :, :] = this_subject.data[:, this_subject.ch_names.index(channel), :, :]
+        left_data = np.mean(left_data, axis=1)
+        right_data = np.zeros((this_subject.data.shape[0], len(Right_channels), this_subject.data.shape[2], this_subject.data.shape[3]))
+        for idx, channel in enumerate(Right_channels):
+            right_data[:, idx, :, :] = this_subject.data[:, this_subject.ch_names.index(channel), :, :]
+        right_data = np.mean(right_data, axis=1)
+    elif channel == "FC":
+        left_data = this_subject.data[:, this_subject.ch_names.index('FC1'), :, :]
+        right_data = this_subject.data[:, this_subject.ch_names.index('FC2'), :, :]
+    elif channel == "C":
+        left_data = this_subject.data[:, this_subject.ch_names.index('C3'), :, :]
+        right_data = this_subject.data[:, this_subject.ch_names.index('C4'), :, :]
+    elif channel == "CP":
+        left_data = this_subject.data[:, this_subject.ch_names.index('CP1'), :, :]
+        right_data = this_subject.data[:, this_subject.ch_names.index('CP2'), :, :]
+    else:
+        raise ValueError("Invalid channel name")
+    
+    # Compute the contralateral and ipsilateral TFRs for the left and right channels
+    events = this_subject.events
+    event_id = {'Left':10002,'Invalid':10003, 'Right':10004}
+    Left_contra = left_data[events[:, 2] == event_id['Right'],:,:]
+    Left_ipsi = left_data[events[:, 2] == event_id['Left'],:,:]
+
+    Right_contra = right_data[events[:, 2] == event_id['Left'],:,:]
+    Right_ipsi = right_data[events[:, 2] == event_id['Right'],:,:]
+
+    assert Left_contra.shape[0] == Left_ipsi.shape[0] == Right_contra.shape[0] == Right_ipsi.shape[0] == 45, "The number of trials for the contra and ipsi is incorrect"
+
+    Left_contra_mean = Left_contra.mean(axis=0)
+    Left_ipsi_mean = Left_ipsi.mean(axis=0)
+    Right_contra_mean = Right_contra.mean(axis=0)
+    Right_ipsi_mean = Right_ipsi.mean(axis=0)
+
+    # Compute the lateralization index for the left and right channels - [((contralateral - ipsilateral)/ ipsilateral)  x 100]
+    Left_lat_index = ((Left_contra_mean - Left_ipsi_mean)/Left_ipsi_mean)*100
+    Right_lat_index = ((Right_contra_mean - Right_ipsi_mean)/Right_ipsi_mean)*100
+    
+    # average this percentage value for the two channels (left and right)
+    Mean_lat_index = (Left_lat_index + Right_lat_index)/2
+    return Mean_lat_index
 
 
+# Function to extract the lateralization index for the EMG data
+def Extract_Lat_index_EMG(epochs, path,normalise_baseline = True):
+    """
+    Computes the EMG lateralization index for a given subject.
 
+    Parameters:
+    - sample_subject: mne.tfr object with EEG/EMG data and events.
+    - event_id: dict mapping event names to IDs (e.g., {'Left': 1, 'Invalid': 3, 'Right': 2}).
+    - expected_trials: int, expected number of trials for validation.
+
+    Returns:
+    - Mean_lat_index: float, average lateralization index across left and right arms.
+    """
+
+    left_data_time = epochs.get_data()[:, epochs.ch_names.index('EMG_left'), :]
+    right_data_time = epochs.get_data()[:, epochs.ch_names.index('EMG_right'), :]
+
+    # Normalise to the first second of each epoch
+    if normalise_baseline:
+        timebegin = np.argmin(np.abs(epochs.times - (-4)))
+        timeend = np.argmin(np.abs(epochs.times - (-3)))
+        right_mean = right_data_time[:,timebegin:timeend].mean(axis = 1, keepdims=True)
+        right_std = right_data_time[:,timebegin:timeend].std(axis = 1, keepdims=True)
+        right_data_time = (right_data_time - right_mean)/right_std
+
+        left_mean = left_data_time[:,timebegin:timeend].mean(axis = 1, keepdims=True)
+        left_std = left_data_time[:,timebegin:timeend].std(axis = 1, keepdims=True)
+        left_data_time = (left_data_time - left_mean)/left_std
+
+    # Compute RMS
+    left_rms = np.sqrt(np.mean(left_data_time**2, axis=1))
+    right_rms = np.sqrt(np.mean(right_data_time**2, axis=1))
+
+    # Identify outliers using z-score
+    z_thresh = 3  # Common threshold (adjustable)
+    left_mean, left_std = np.mean(left_rms), np.std(left_rms)
+    right_mean, right_std = np.mean(right_rms), np.std(right_rms)
+    left_outliers = np.where((np.abs(left_rms - left_mean) / left_std) > z_thresh)[0]
+    right_outliers = np.where((np.abs(right_rms - right_mean) / right_std) > z_thresh)[0]
+    left_trials2use = np.ones(len(left_rms), dtype=bool)
+    left_trials2use[left_outliers] = False
+    right_trials2use = np.ones(len(right_rms), dtype=bool)
+    right_trials2use[right_outliers] = False
+    print(f'Number of outliers identified in left: {len(left_outliers)}')
+    print(f'Number of outliers identified in right: {len(right_outliers)}')
+
+    trials2use = {'Left': left_trials2use, 'Right': right_trials2use}
+    # save to path
+    source_path = path.split('/')[:-1]
+    source_path = '/'.join(source_path) + '/'
+    path = os.path.join(source_path, 'trials2use.npy')
+    np.save(path, trials2use)
+
+    # Then Z normalise both left and right data in the time domain, but without taking those outliers into consideration
+    if not normalise_baseline:
+        left_mean = left_data_time[left_trials2use,:].reshape(1,-1).mean(axis = 1)
+        left_std = left_data_time[left_trials2use,:].reshape(1,-1).std(axis = 1)
+        left_data_time = (left_data_time - left_mean)/left_std
+
+        right_mean = right_data_time[right_trials2use,:].reshape(1,-1).mean(axis = 1)
+        right_std = right_data_time[right_trials2use,:].reshape(1,-1).std(axis = 1)
+        right_data_time = (right_data_time - right_mean)/right_std
+
+    # Replace only the relevant channels with the normalized data
+    left_data_time = np.expand_dims(left_data_time, axis=1)
+    right_data_time = np.expand_dims(right_data_time, axis=1)
+
+    new_data = np.concatenate([left_data_time, right_data_time], axis = 1)
+    epochs_normalised = mne.EpochsArray(new_data, epochs.info, events=epochs.events, event_id=epochs.event_id, tmin=epochs.tmin)
+
+    frequencies = np.arange(3, 51, 1)  # Define frequencies of interest
+    n_cycles = frequencies/2
+    sample_subject = epochs_normalised.compute_tfr(method = 'morlet', 
+                                        freqs = frequencies,
+                                        n_cycles = n_cycles,
+                                        output='power',
+                                        picks='emg',
+                                        average=False, 
+                                        return_itc=False)
+
+    events = sample_subject.events
+    event_id = {'Left': 1, 'Invalid':3, 'Right':2}
+
+    left_data = sample_subject.data[:, sample_subject.ch_names.index('EMG_left'), :, :]
+    right_data = sample_subject.data[:, sample_subject.ch_names.index('EMG_right'), :, :]
+
+    assert left_data.shape[0] == right_data.shape[0], "Number of trials in the left and right hand data is not the same"
+
+    Left_contra = left_data[events[:, 2] == event_id['Right'],:,:]
+    left_contra_inclusions = left_trials2use[events[:, 2] == event_id['Right']]
+    Left_ipsi = left_data[events[:, 2] == event_id['Left'],:,:]
+    left_ipsi_inclusions = left_trials2use[events[:, 2] == event_id['Left']]
+
+    Right_contra = right_data[events[:, 2] == event_id['Left'],:,:]
+    right_contra_inclusions = right_trials2use[events[:, 2] == event_id['Left']]
+    Right_ipsi = right_data[events[:, 2] == event_id['Right'],:,:]
+    right_ipsi_inclusions = right_trials2use[events[:, 2] == event_id['Right']]
+
+    assert Left_contra.shape[0] == Left_ipsi.shape[0] == Right_contra.shape[0] == Right_ipsi.shape[0] == 45, "The number of trials for the contra and ipsi is incorrect"
+
+    Left_contra_mean = Left_contra[left_contra_inclusions,:,:].mean(axis=0)
+    Left_ipsi_mean = Left_ipsi[left_ipsi_inclusions,:,:].mean(axis=0)
+    Right_contra_mean = Right_contra[right_contra_inclusions,:,:].mean(axis=0)
+    Right_ipsi_mean = Right_ipsi[right_ipsi_inclusions,:,:].mean(axis=0)
+
+    # Compute the lateralization index for the left and right channels - ((ipsilateral-contralateral)/contralateral) x 100
+    Left_lat_index = ((Left_ipsi_mean - Left_contra_mean)/Left_contra_mean)*100
+    Right_lat_index = ((Right_ipsi_mean - Right_contra_mean)/Right_contra_mean)*100
+
+    # average this percentage value for the two channels (left and right)
+    Mean_lat_index = (Left_lat_index + Right_lat_index)/2
+    return Mean_lat_index, Left_lat_index, Right_lat_index
+
+# Function to compute coherence between EMG and each of the contralateral and ipsilateral EEG channels across all trials
+def Compute_coherence_contra_ipsi(Subject_EEG, Subject_EMG, tmin, tmax, Left_channels, Right_channels, trials2use):
+    fmin = 0
+    fmax = 60
+    fs = Subject_EEG.info['sfreq']
+    bw = 4
+    left_EMG = Subject_EMG.crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_left').squeeze()
+    right_EMG = Subject_EMG.crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_right').squeeze()
+
+    left_EEG = []
+    right_EEG = []
+    for chan in Left_channels:
+        left_EEG.append(Subject_EEG.crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    for chan in Right_channels:
+        right_EEG.append(Subject_EEG.crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    left_EEG = np.array(left_EEG)
+    right_EEG = np.array(right_EEG)
+    assert Subject_EEG.info['sfreq'] == Subject_EMG.info['sfreq'], "Sampling frequency is not 1000 Hz"
+
+    # For the left arm
+    left_contra_coherence = {}
+    left_ipsi_coherence = {}
+    for channel in range(left_EEG.shape[0]):
+        contra_coherence = []
+        ipsi_coherence = []
+        for trial in range(left_EMG.shape[0]):
+            if not trials2use['Left'][trial]:
+                continue
+            frequencies, coherence = Compute_coherence_multitaper(left_EMG[trial,:], left_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            ipsi_coherence.append(coherence)
+
+            frequencies, coherence = Compute_coherence_multitaper(left_EMG[trial,:], right_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            contra_coherence.append(coherence)
+        contra_coherence = np.array(contra_coherence)
+        ipsi_coherence = np.array(ipsi_coherence)
+        left_contra_coherence[Right_channels[channel]] = contra_coherence.mean(axis=0)
+        left_ipsi_coherence[Left_channels[channel]] = ipsi_coherence.mean(axis=0)
+
+    # Right Arm
+    right_contra_coherence = {}
+    right_ipsi_coherence = {}
+
+    for channel in range(right_EEG.shape[0]):
+        contra_coherence = []
+        ipsi_coherence = []
+        for trial in range(right_EMG.shape[0]):
+            if not trials2use['Right'][trial]:
+                continue
+            frequencies, coherence = Compute_coherence_multitaper(right_EMG[trial,:], right_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            ipsi_coherence.append(coherence)
+
+            frequencies, coherence = Compute_coherence_multitaper(right_EMG[trial,:], left_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            contra_coherence.append(coherence)
+        contra_coherence = np.array(contra_coherence)
+        ipsi_coherence = np.array(ipsi_coherence)
+        right_contra_coherence[Left_channels[channel]] = contra_coherence.mean(axis=0)
+        right_ipsi_coherence[Right_channels[channel]] = ipsi_coherence.mean(axis=0)
+
+    return left_contra_coherence, left_ipsi_coherence, right_contra_coherence, right_ipsi_coherence, frequencies
+
+
+def Extract_Anticipatory_Coherence(Subject_EEG, Subject_EMG, tmin, tmax, Left_channels, Right_channels, trials2use):
+    fmin = 0
+    fmax = 60
+    fs = Subject_EEG.info['sfreq']
+    bw = 4
+    left_EMG = Subject_EMG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_left').squeeze()
+    left_trials2use = trials2use['Left'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Left']]
+    right_EMG = Subject_EMG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_right').squeeze()
+    right_trials2use = trials2use['Right'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Right']]
+
+    left_EEG = []
+    right_EEG = []
+    for chan in Left_channels:
+        left_EEG.append(Subject_EEG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    for chan in Right_channels:
+        right_EEG.append(Subject_EEG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    left_EEG = np.array(left_EEG)
+    right_EEG = np.array(right_EEG)
+    assert Subject_EEG.info['sfreq'] == Subject_EMG.info['sfreq'], "Sampling frequency is not 1000 Hz"
+
+    # For the left arm
+    left_contra_coherence = {}
+    for channel in range(right_EEG.shape[0]):
+        contra_coherence = []
+        for trial in range(left_EMG.shape[0]):
+            if not left_trials2use[trial]:
+                continue
+            frequencies, coherence = Compute_coherence_multitaper(left_EMG[trial,:], right_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            contra_coherence.append(coherence)
+        contra_coherence = np.array(contra_coherence)
+        left_contra_coherence[Right_channels[channel]] = contra_coherence.mean(axis=0)
+
+    # Right Arm
+    right_contra_coherence = {} 
+    for channel in range(left_EEG.shape[0]):
+        contra_coherence = []
+        for trial in range(right_EMG.shape[0]):
+            if not right_trials2use[trial]:
+                continue
+            frequencies, coherence = Compute_coherence_multitaper(right_EMG[trial,:], left_EEG[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+            contra_coherence.append(coherence)
+        contra_coherence = np.array(contra_coherence)
+        right_contra_coherence[Left_channels[channel]] = contra_coherence.mean(axis=0)
+
+    return left_contra_coherence, right_contra_coherence, frequencies
+
+
+# 2) coherence between the EMG channels and the ipsilateral EEG channels for the trials 
+# where the stimulation/attention was given to the arm ipsilateral to the EMG. 
+def Extract_Coherence_Condition2(Subject_EEG, Subject_EMG, tmin, tmax, Left_channels, Right_channels, trials2use):
+    fmin = 0
+    fmax = 60
+    fs = Subject_EEG.info['sfreq']
+    bw = 4
+    left_EMG_left_stim = Subject_EMG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_left').squeeze()
+    right_EMG_right_stim = Subject_EMG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_right').squeeze()
+    left_EMG_right_stim = Subject_EMG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_left').squeeze()
+    right_EMG_left_stim = Subject_EMG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks='EMG_right').squeeze()
+
+    # Extract the trials to be used
+    Left_leftStim_trials = trials2use['Left'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Left']]
+    Left_rightStim_trials = trials2use['Left'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Right']]
+    Right_leftStim_trials = trials2use['Right'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Left']]
+    Right_rightStim_trials = trials2use['Right'][Subject_EMG.events[:,2] == Subject_EMG.event_id['Right']]
+
+    left_EEG_left_stim = []
+    right_EEG_right_stim = []
+    left_EEG_right_stim = []
+    right_EEG_left_stim = []
+    for chan in Left_channels:
+        left_EEG_left_stim.append(Subject_EEG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+        left_EEG_right_stim.append(Subject_EEG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    for chan in Right_channels:
+        right_EEG_right_stim.append(Subject_EEG['Right'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+        right_EEG_left_stim.append(Subject_EEG['Left'].crop(tmin=tmin, tmax=tmax).get_data(picks=chan).squeeze())
+    left_EEG_left_stim = np.array(left_EEG_left_stim)
+    left_EEG_right_stim = np.array(left_EEG_right_stim)
+    right_EEG_right_stim = np.array(right_EEG_right_stim)
+    right_EEG_left_stim = np.array(right_EEG_left_stim)
+    assert Subject_EEG.info['sfreq'] == Subject_EMG.info['sfreq'], "Sampling frequency is not 1000 Hz"
+
+    # Right Arm
+    right_ipsi_right_stim = {} 
+    right_ipsi_left_stim = {}
+    for channel in range(len(Right_channels)):
+        ipsi_coherence_right_stim = []
+        ipsi_coherence_left_stim = []
+        for trial in range(right_EMG_right_stim.shape[0]):
+            if Right_rightStim_trials[trial]:
+                frequencies, coherence = Compute_coherence_multitaper(right_EMG_right_stim[trial,:], right_EEG_right_stim[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+                ipsi_coherence_right_stim.append(coherence)
+            if Right_leftStim_trials[trial]:
+                frequencies, coherence = Compute_coherence_multitaper(right_EMG_left_stim[trial,:], right_EEG_left_stim[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+                ipsi_coherence_left_stim.append(coherence)
+        ipsi_coherence_right_stim = np.array(ipsi_coherence_right_stim)
+        ipsi_coherence_left_stim = np.array(ipsi_coherence_left_stim)
+        right_ipsi_right_stim[Right_channels[channel]] = ipsi_coherence_right_stim.mean(axis=0)
+        right_ipsi_left_stim[Right_channels[channel]] = ipsi_coherence_left_stim.mean(axis=0)
+
+    # Left Arm
+    left_ipsi_left_stim = {}
+    left_ipsi_right_stim = {}
+    for channel in range(len(Left_channels)):
+        ipsi_coherence_left_stim = []
+        ipsi_coherence_right_stim = []
+        for trial in range(left_EMG_left_stim.shape[0]):
+            if Left_leftStim_trials[trial]:
+                frequencies, coherence = Compute_coherence_multitaper(left_EMG_left_stim[trial,:], left_EEG_left_stim[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+                ipsi_coherence_left_stim.append(coherence)
+            if Left_rightStim_trials[trial]:
+                frequencies, coherence = Compute_coherence_multitaper(left_EMG_right_stim[trial,:], left_EEG_right_stim[channel,trial,:], fmin=fmin, fmax=fmax, fs = fs, bw=bw)
+                ipsi_coherence_right_stim.append(coherence)
+        ipsi_coherence_left_stim = np.array(ipsi_coherence_left_stim)
+        ipsi_coherence_right_stim = np.array(ipsi_coherence_right_stim)
+        left_ipsi_left_stim[Left_channels[channel]] = ipsi_coherence_left_stim.mean(axis=0)
+        left_ipsi_right_stim[Left_channels[channel]] = ipsi_coherence_right_stim.mean(axis=0)
+
+    return right_ipsi_right_stim, right_ipsi_left_stim, left_ipsi_left_stim, left_ipsi_right_stim, frequencies
+
+
+# Extract trial level binned lateralization 
+def Extract_sorted_lateralization(Subject_EEG, Subject_EMG, tmin, tmax, fmin, fmax, Left_channels, Right_channels, trials2use, normalise_baseline = True, outlier_threshold = 3):
+    # Extract average power for the left and right EEG channels and average together
+
+    # Normalise to the first second of each epoch
+    if normalise_baseline:
+        left_data_time = Subject_EMG.get_data()[:, Subject_EMG.ch_names.index('EMG_left'), :]
+        right_data_time = Subject_EMG.get_data()[:, Subject_EMG.ch_names.index('EMG_right'), :]
+
+        timebegin = np.argmin(np.abs(Subject_EMG.times - (-4)))
+        timeend = np.argmin(np.abs(Subject_EMG.times - (-3)))
+        right_mean = right_data_time[:,timebegin:timeend].mean(axis = 1, keepdims=True)
+        right_std = right_data_time[:,timebegin:timeend].std(axis = 1, keepdims=True)
+        right_data_time = (right_data_time - right_mean)/right_std
+
+        left_mean = left_data_time[:,timebegin:timeend].mean(axis = 1, keepdims=True)
+        left_std = left_data_time[:,timebegin:timeend].std(axis = 1, keepdims=True)
+        left_data_time = (left_data_time - left_mean)/left_std
+
+        # Compute RMS
+        left_rms = np.sqrt(np.mean(left_data_time**2, axis=1))
+        right_rms = np.sqrt(np.mean(right_data_time**2, axis=1))
+
+        # Identify outliers using z-score
+        z_thresh = outlier_threshold  # Common threshold (adjustable)
+        left_mean, left_std = np.mean(left_rms), np.std(left_rms)
+        right_mean, right_std = np.mean(right_rms), np.std(right_rms)
+        left_outliers = np.where((np.abs(left_rms - left_mean) / left_std) > z_thresh)[0]
+        right_outliers = np.where((np.abs(right_rms - right_mean) / right_std) > z_thresh)[0]
+        left_trials2use = np.ones(len(left_rms), dtype=bool)
+        left_trials2use[left_outliers] = False
+        right_trials2use = np.ones(len(right_rms), dtype=bool)
+        right_trials2use[right_outliers] = False
+
+        # Put the data back into the epochs
+        Subject_EMG._data[:, Subject_EMG.ch_names.index('EMG_left'), :] = left_data_time
+        Subject_EMG._data[:, Subject_EMG.ch_names.index('EMG_right'), :] = right_data_time
+
+    Left_EEG_power = Subject_EEG.compute_psd(fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax, picks=Left_channels).get_data().mean(axis=1).mean(axis=1).squeeze()
+    Right_EEG_power = Subject_EEG.compute_psd(fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax, picks=Right_channels).get_data().mean(axis=1).mean(axis=1).squeeze()
+
+    # Extract average power for the left and right EMG channels and average together
+    Left_EMG_power = Subject_EMG.compute_psd(tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, picks='EMG_left').get_data(picks='EMG_left').mean(axis=2).squeeze()
+    Right_EMG_power = Subject_EMG.compute_psd(tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, picks='EMG_right').get_data(picks='EMG_right').mean(axis=2).squeeze()
+
+    # Calculate the normalized difference in beta power between the left and right recording sites
+    Cortical_lateralization = (Right_EEG_power - Left_EEG_power) / (Right_EEG_power + Left_EEG_power)
+    Muscular_lateralization = (Left_EMG_power - Right_EMG_power) / (Left_EMG_power + Right_EMG_power)
+
+    # Sort the trials according to cortical lateralization (separately for left- and right-cued trials) and place them into five consecutive bins.
+    EEG_events = Subject_EEG.events
+    EMG_events = Subject_EMG.events
+
+    EEG_event_id = Subject_EEG.event_id
+    EMG_event_id = Subject_EMG.event_id
+
+    if not normalise_baseline:
+        left_trials2use = trials2use['Left']
+        right_trials2use = trials2use['Right']
+    combined_trials2use = np.array([l and r for l, r in zip(left_trials2use, right_trials2use)])
+
+    Cortical_lateralization_left = Cortical_lateralization[EEG_events[:,2] == EEG_event_id['Left']]
+    Cortical_lateralization_right = Cortical_lateralization[EEG_events[:,2] == EEG_event_id['Right']]
+
+    Muscular_lateralization_left = Muscular_lateralization[EMG_events[:,2] == EMG_event_id['Left']]
+    Muscular_lateralization_right = Muscular_lateralization[EMG_events[:,2] == EMG_event_id['Right']]
+
+    trials2use_left = combined_trials2use[EEG_events[:,2] == EEG_event_id['Left']]
+    trials2use_right = combined_trials2use[EEG_events[:,2] == EEG_event_id['Right']]
+
+    # Sort cortical lateralisation and get the sorting indices
+    Cortical_lateralization_left_sortind = np.argsort(Cortical_lateralization_left)
+    Cortical_lateralization_right_sortind = np.argsort(Cortical_lateralization_right)
+
+    # Sort the cortical and muscular lateralisation
+    Cortical_lateralization_left_sorted = Cortical_lateralization_left[Cortical_lateralization_left_sortind]
+    Cortical_lateralization_right_sorted = Cortical_lateralization_right[Cortical_lateralization_right_sortind]
+
+    Muscular_lateralization_left_sorted = Muscular_lateralization_left[Cortical_lateralization_left_sortind]
+    Muscular_lateralization_right_sorted = Muscular_lateralization_right[Cortical_lateralization_right_sortind]
+
+    trials2use_left_sorted = trials2use_left[Cortical_lateralization_left_sortind]
+    trials2use_right_sorted = trials2use_right[Cortical_lateralization_right_sortind]
+
+    # Bin the data into 5 consecutive bins
+    bins = 5
+    Cortical_lateralization_left_binned = np.array_split(Cortical_lateralization_left_sorted, bins)
+    Cortical_lateralization_right_binned = np.array_split(Cortical_lateralization_right_sorted, bins)
+    Muscular_lateralization_left_binned = np.array_split(Muscular_lateralization_left_sorted, bins)
+    Muscular_lateralization_right_binned = np.array_split(Muscular_lateralization_right_sorted, bins)
+
+    trials2use_left_sorted_binned = np.array_split(trials2use_left_sorted, bins)
+    trials2use_right_sorted_binned = np.array_split(trials2use_right_sorted, bins)
+
+    # Average the bins
+    Cortical_lateralization_left_mean = np.array([np.mean(bin[trials2use_left_sorted_binned[i]]) for i, bin in enumerate(Cortical_lateralization_left_binned)])
+    Cortical_lateralization_right_mean = np.array([np.mean(bin[trials2use_right_sorted_binned[i]]) for i, bin in enumerate(Cortical_lateralization_right_binned)])
+    Muscular_lateralization_left_mean = np.array([np.mean(bin[trials2use_left_sorted_binned[i]]) for i, bin in enumerate(Muscular_lateralization_left_binned)])
+    Muscular_lateralization_right_mean = np.array([np.mean(bin[trials2use_right_sorted_binned[i]]) for i, bin in enumerate(Muscular_lateralization_right_binned)])
+
+    return Cortical_lateralization_left_mean, Cortical_lateralization_right_mean, Muscular_lateralization_left_mean, Muscular_lateralization_right_mean
